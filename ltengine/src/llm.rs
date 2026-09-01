@@ -244,7 +244,7 @@ impl LLMContext<'_>{
         let seq_breakers = vec![b"\n", b":", b"\"", b"*"];
 
         let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::penalties(64, 1.0, 0.0, 0.0),
+            LlamaSampler::penalties(self.llm.model.n_vocab(), 64, 1.0, 0.0, 0.0),
             LlamaSampler::dry(&self.llm.model, 0.0, 1.75, 2, -1, seq_breakers),
             LlamaSampler::top_k(40),
             LlamaSampler::typical(1.0, 0),
