@@ -1,6 +1,12 @@
 .git
 .github
 .vscode
+.env
+.env.*
+*.gguf
+*.key
+*.pem
+*.safetensors
 llama-cpp-rs
 target
 *.md
