@@ -79,7 +79,19 @@ pub struct LLM {
 pub struct LLMContext<'a>{
     llm: &'a LLM,
     ctx: LlamaContext<'a>,
-    ctx_size: i32
+    ctx_size: i32,
+}
+
+fn context_size(token_count: usize) -> Result<i32> {
+    if token_count == 0 {
+        return Err(anyhow::anyhow!("Prompt tokenization produced no tokens"));
+    }
+
+    token_count
+        .checked_mul(3)
+        .and_then(|size| i32::try_from(size).ok())
+        .filter(|size| *size > token_count as i32)
+        .context("Prompt is too large for a llama context")
 }
 
 impl LLM {
@@ -164,10 +176,11 @@ impl LLM {
         Ok(LLM { backend, model, prompt_lock: Arc::new(Semaphore::new(1)), n_ubatch })
     }
 
-    pub fn create_context(&self, ctx_size: i32) -> Result<LLMContext<'_>>{
+    fn create_context(&self, ctx_size: i32) -> Result<LLMContext<'_>>{
+        let ctx_size = u32::try_from(ctx_size).context("Invalid llama context size")?;
         let ctx_params =
             LlamaContextParams::default()
-                .with_n_ctx(Some(NonZeroU32::new(ctx_size as u32).unwrap()))
+                .with_n_ctx(NonZeroU32::new(ctx_size))
                 .with_n_ubatch(self.n_ubatch);
 
         // Use all threads
@@ -177,7 +190,7 @@ impl LLM {
         let ctx = self.model
             .new_context(&self.backend, ctx_params)
             .with_context(|| "Unable to create the llama context")?;
-        Ok(LLMContext{ llm: self, ctx, ctx_size })
+        Ok(LLMContext { llm: self, ctx, ctx_size: ctx_size as i32 })
     }
 
     pub async fn run_prompt(self: &Arc<Self>, system: String, user: String) -> Result<String>{
@@ -226,7 +239,7 @@ impl LLM {
         // for token in &tokens_list {
         //     eprint!("{} {} | ", self.model.token_to_str(*token, Special::Tokenize)?, token);
         // }
-        let ctx_size: i32 = tokens_list.len() as i32 * 3;
+        let ctx_size = context_size(tokens_list.len())?;
         let mut ctx = self.create_context(ctx_size)?;
         ctx.process(tokens_list)
     }
@@ -239,7 +252,7 @@ impl LLMContext<'_>{
         // We use this object to submit token data for decoding
         let mut batch = LlamaBatch::new(self.ctx_size.try_into()?, 1);
 
-        let last_index: i32 = (tokens_list.len() - 1) as i32;
+        let last_index = i32::try_from(tokens_list.len() - 1)?;
         for (i, token) in (0_i32..).zip(tokens_list.into_iter()) {
             // llama_decode will output logits only for the last token of the prompt
             let is_last = i == last_index;
@@ -268,7 +281,7 @@ impl LLMContext<'_>{
 
         let mut output = String::new();
 
-        while n_cur <= self.ctx_size {
+        while n_cur < self.ctx_size {
 
             // sample the next token
             {
@@ -290,7 +303,9 @@ impl LLMContext<'_>{
 
             n_cur += 1;
 
-            self.ctx.decode(&mut batch).with_context(|| "Failed to eval")?;
+            if n_cur < self.ctx_size {
+                self.ctx.decode(&mut batch).with_context(|| "Failed to eval")?;
+            }
         }
 
         // Gemma 4 thinking mode emits thinking content before the actual response in two forms:
@@ -314,5 +329,17 @@ impl LLMContext<'_>{
         }
 
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::context_size;
+
+    #[test]
+    fn context_size_reserves_generation_space_without_overflow() {
+        assert_eq!(context_size(10).unwrap(), 30);
+        assert!(context_size(0).is_err());
+        assert!(context_size(usize::MAX).is_err());
     }
 }
