@@ -1316,11 +1316,11 @@ dependencies = [
  "hf-hub",
  "llama-cpp-2",
  "once_cell",
- "parking_lot",
  "serde",
  "serde_json",
  "static-files 0.2.5",
  "thiserror 1.0.69",
+ "tokio",
  "whatlang",
 ]
 

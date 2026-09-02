@@ -9,8 +9,9 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use anyhow::{Result, Context};
 
 #[derive(Debug, thiserror::Error)]
@@ -71,7 +72,7 @@ fn pick_n_ubatch(use_gpu: bool) -> u32 {
 pub struct LLM {
     backend: LlamaBackend,
     model: LlamaModel,
-    prompt_lock: Mutex<()>,
+    prompt_lock: Arc<Semaphore>,
     n_ubatch: u32,
 }
 
@@ -160,7 +161,7 @@ impl LLM {
             (true, Some(n)) => eprintln!("ltengine: {}/{} model layers on GPU, rest on CPU", n, model.n_layer()),
         }
 
-        Ok(LLM { backend, model, prompt_lock: Mutex::new(()), n_ubatch })
+        Ok(LLM { backend, model, prompt_lock: Arc::new(Semaphore::new(1)), n_ubatch })
     }
 
     pub fn create_context(&self, ctx_size: i32) -> Result<LLMContext<'_>>{
@@ -179,7 +180,25 @@ impl LLM {
         Ok(LLMContext{ llm: self, ctx, ctx_size })
     }
 
-    pub fn run_prompt(&self, system: String, user: String) -> Result<String>{
+    pub async fn run_prompt(self: &Arc<Self>, system: String, user: String) -> Result<String>{
+        let permit = tokio::time::timeout(
+            Duration::from_secs(120),
+            self.prompt_lock.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| LLMError::Busy)?
+        .context("Inference queue closed")?;
+        let llm = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            llm.run_prompt_blocking(system, user)
+        })
+        .await
+        .context("Inference worker failed")?
+    }
+
+    fn run_prompt_blocking(&self, system: String, user: String) -> Result<String>{
         let messages = [
             LlamaChatMessage::new("user".to_string(), format!("{system}\n\n{user}"))
                 .context("Failed to build chat message")?
@@ -208,14 +227,6 @@ impl LLM {
         //     eprint!("{} {} | ", self.model.token_to_str(*token, Special::Tokenize)?, token);
         // }
         let ctx_size: i32 = tokens_list.len() as i32 * 3;
-        // Lock before create_context: context allocation uses GPU resources and
-        // two concurrent allocations corrupt each other even before inference starts.
-        // TODO: The llama bindings (or llama itself?) do not appear to be totally thread-safe
-        // as garbage starts to come out when we run inference in parallel
-        // this might need to be investigated and fixed. For now we lock and process requests
-        // one at a time.
-        let _lock = self.prompt_lock.try_lock_for(Duration::from_secs(120))
-            .ok_or(LLMError::Busy)?;
         let mut ctx = self.create_context(ctx_size)?;
         ctx.process(tokens_list)
     }
