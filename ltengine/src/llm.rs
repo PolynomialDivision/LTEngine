@@ -176,11 +176,15 @@ impl LLM {
         Ok(LLM { backend, model, prompt_lock: Arc::new(Semaphore::new(1)), n_ubatch })
     }
 
-    fn create_context(&self, ctx_size: i32) -> Result<LLMContext<'_>>{
+    fn create_context(&self, ctx_size: i32, prompt_tokens: usize) -> Result<LLMContext<'_>>{
         let ctx_size = u32::try_from(ctx_size).context("Invalid llama context size")?;
+        let n_batch = u32::try_from(prompt_tokens)
+            .context("Prompt is too large for a llama batch")?
+            .max(self.n_ubatch);
         let ctx_params =
             LlamaContextParams::default()
                 .with_n_ctx(NonZeroU32::new(ctx_size))
+                .with_n_batch(n_batch)
                 .with_n_ubatch(self.n_ubatch);
 
         // Use all threads
@@ -240,7 +244,7 @@ impl LLM {
         //     eprint!("{} {} | ", self.model.token_to_str(*token, Special::Tokenize)?, token);
         // }
         let ctx_size = context_size(tokens_list.len())?;
-        let mut ctx = self.create_context(ctx_size)?;
+        let mut ctx = self.create_context(ctx_size, tokens_list.len())?;
         ctx.process(tokens_list)
     }
 }
@@ -250,7 +254,7 @@ impl LLMContext<'_>{
         // let ctx_size: i32 = tokens_list.len() as i32 * 3;
         
         // We use this object to submit token data for decoding
-        let mut batch = LlamaBatch::new(self.ctx_size.try_into()?, 1);
+        let mut batch = LlamaBatch::new(tokens_list.len(), 1);
 
         let last_index = i32::try_from(tokens_list.len() - 1)?;
         for (i, token) in (0_i32..).zip(tokens_list.into_iter()) {
