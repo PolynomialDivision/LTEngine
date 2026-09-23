@@ -8,6 +8,9 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 pub struct ErrorResponse {
     pub error: String,
     pub status: u16,
+    /// Seconds after which a retry is expected to succeed (`Retry-After`).
+    #[serde(skip)]
+    pub retry_after: Option<u32>,
 }
 
 impl Display for ErrorResponse {
@@ -22,8 +25,11 @@ impl ResponseError for ErrorResponse {
     }
 
     fn error_response(&self) -> HttpResponse<BoxBody> {
-        HttpResponse::build(self.status_code())
-            .json(serde_json::json!({"error": self.error.clone()}))
+        let mut response = HttpResponse::build(self.status_code());
+        if let Some(seconds) = self.retry_after {
+            response.insert_header((actix_web::http::header::RETRY_AFTER, seconds.to_string()));
+        }
+        response.json(serde_json::json!({"error": self.error.clone()}))
     }
 }
 
@@ -32,6 +38,7 @@ impl From<actix_web::Error> for ErrorResponse {
         ErrorResponse {
             error: err.to_string(),
             status: err.as_response_error().status_code().as_u16(),
+            retry_after: None,
         }
     }
 }

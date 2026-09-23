@@ -56,7 +56,7 @@ LTEngine supports any GGUF language model supported by [llama.cpp](https://githu
 | ---------------------- | ----------------------------------- | ---------- | ------------------------------------------------ |
 | `translategemma-4b`    | TranslateGemma 4B, Q5_K_M (2.7 GB)  | ~3.2 GB    | **Default.** Fits fully on a 4 GB GPU            |
 | `translategemma-4b-q4` | TranslateGemma 4B, Q4_K_M (2.4 GB)  | ~2.9 GB    | For 4 GB GPUs shared with other workloads        |
-| `translategemma-12b`   | TranslateGemma 12B, Q4_K_M (7.0 GB) | ~8 GB      | Better quality, needs ≥ 10 GB                    |
+| `translategemma-12b`   | TranslateGemma 12B, Q4_K_M (7.0 GB) | ~8 GB      | Best quality. Runs on a 4 GB GPU with partial offload (see below) |
 | `gemma3-1b` … `gemma3-27b`, `gemma4-e4b` | Gemma chat models  |            | Generic translation prompt                       |
 
 GPU memory figures are estimates (weights + KV cache + compute buffers at the default 4096-token context); the startup log reports the real usage.
@@ -96,7 +96,7 @@ LTEngine is tuned so that if startup succeeds, requests cannot run out of GPU me
 | `--vram-margin` (`LTENGINE_VRAM_MARGIN`)      | 512/1024 | MiB of VRAM to leave free                           |
 | `--ctx-size` (`LTENGINE_CTX_SIZE`)            | 4096    | Tokens for prompt + translation                      |
 | `--batch-size` / `--ubatch-size`              | 512 / auto | Logical / physical batch size                     |
-| `--threads` (`LTENGINE_THREADS`)              | cores, ≤ 8 | CPU threads                                       |
+| `--threads` (`LTENGINE_THREADS`)              | physical cores | CPU threads                                   |
 | `--kv-cache-type` (`LTENGINE_KV_CACHE_TYPE`)  | `f16`   | `q8_0` halves KV memory                              |
 | `--flash-attn` (`LTENGINE_FLASH_ATTN`)        | `auto`  | `auto`, `on`, `off`                                  |
 | `--max-new-tokens` (`LTENGINE_MAX_NEW_TOKENS`)| 2048    | Hard cap on generated tokens                         |
@@ -108,9 +108,25 @@ LTEngine is tuned so that if startup succeeds, requests cannot run out of GPU me
 | `--cpu` / `--allow-cpu-fallback`              | off     | CPU only / allow CPU if no GPU                       |
 | `-v` (`LTENGINE_VERBOSE`), `RUST_LOG`         | `info`  | Logging (`-v` includes llama.cpp logs)               |
 
+### Larger models on a small GPU
+
+Models that don't fit into VRAM still use the GPU: the auto-fit keeps as much as possible on it and the rest in system RAM. `translategemma-12b` on a 4 GB GPU keeps about a third of the model on the GPU and needs roughly 8 GB of free RAM. The CPU then computes part of every token, so:
+
+ * generation is limited by RAM bandwidth (expect roughly 5–8 tokens/s instead of ~27 with the 4B model). A long message can take a minute per target language;
+ * CPU threads matter; the default is one per physical core;
+ * clients need generous timeouts. Raise `LTENGINE_QUEUE_TIMEOUT` (e.g. 300) and client timeouts accordingly. While the model (re)loads, and when the queue is full, LTEngine answers `503` with a `Retry-After` header.
+
 ## Docker (NVIDIA GPU, e.g. Unraid)
 
 The image is a multi-stage build: CUDA 12.9 devel for building, slim CUDA base image for running (the CUDA runtime and cuBLAS are linked statically, so the container only needs the host driver). It needs the NVIDIA Container Toolkit (on Unraid: the *Nvidia Driver* plugin) and a driver ≥ 525. Kernels are compiled for `CUDA_ARCHITECTURES=75` (Turing: GTX 16xx, RTX 20xx) by default. Pass e.g. `--build-arg CUDA_ARCHITECTURES="75;86;89"` for other GPUs.
+
+GTX 16xx cards are Turing GPUs *without* tensor cores, and llama.cpp recommends its Pascal code path for them. Build that variant with:
+
+```bash
+docker buildx build --build-arg CUDA_ARCHITECTURES=61-virtual --build-arg GGML_CUDA_FORCE_MMQ=ON -t ltengine:cuda-gtx16 .
+```
+
+The driver JIT-compiles these kernels on first use and caches them in `/models/.cuda-cache`, so the very first start takes longer. Compare `inference_ms` in the logs for the same message on both builds: the output is deterministic, so token counts are identical.
 
 On Unraid:
 

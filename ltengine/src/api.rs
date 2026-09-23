@@ -64,6 +64,7 @@ fn bad_request(error: impl Into<String>) -> ErrorResponse {
     ErrorResponse {
         error: error.into(),
         status: 400,
+        retry_after: None,
     }
 }
 
@@ -120,6 +121,7 @@ fn check_params<'a>(
         return Err(ErrorResponse {
             error: "Invalid API key".to_string(),
             status: 403,
+            retry_after: None,
         });
     }
 
@@ -141,6 +143,7 @@ fn engine_error(err: EngineError) -> ErrorResponse {
     ErrorResponse {
         error: err.to_string(),
         status: err.status(),
+        retry_after: err.retry_after(),
     }
 }
 
@@ -375,6 +378,7 @@ async fn translate_file() -> Result<HttpResponse, ErrorResponse> {
     Err(ErrorResponse {
         error: "Not implemented".to_string(),
         status: 501,
+        retry_after: None,
     })
 }
 
@@ -383,6 +387,7 @@ async fn suggest() -> Result<HttpResponse, ErrorResponse> {
     Err(ErrorResponse {
         error: "Not implemented".to_string(),
         status: 501,
+        retry_after: None,
     })
 }
 

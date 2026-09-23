@@ -14,7 +14,19 @@ ARG RUST_VERSION=1.98.1
 # GPU architectures to compile kernels for. 75 = Turing (GTX 16xx, RTX 20xx).
 # Examples: "75;86;89" for Turing + Ampere + Ada. Fewer architectures build
 # much faster and give a smaller binary.
+#
+# GTX 16xx cards (e.g. GTX 1650) are Turing without tensor cores. llama.cpp
+# recommends its Pascal code path for them:
+#   --build-arg CUDA_ARCHITECTURES=61-virtual --build-arg GGML_CUDA_FORCE_MMQ=ON
+# The driver JIT-compiles that PTX on first use and caches it in
+# CUDA_CACHE_PATH (on the /models volume, so only the first start is slow).
 ARG CUDA_ARCHITECTURES=75
+ARG GGML_CUDA_FORCE_MMQ=OFF
+# CPU instruction set for llama.cpp's CPU code (used for layers that don't fit
+# on the GPU). x86-64-v3 = AVX2/FMA/F16C/BMI2: every x86 CPU since ~2015
+# (Intel Haswell, AMD Zen 1). Without it llama.cpp is built for plain SSE2.
+# Don't use "native": it would target the build machine's CPU.
+ARG RUST_TARGET_CPU=x86-64-v3
 
 ENV RUSTUP_HOME=/root/.rustup \
     CARGO_HOME=/root/.cargo \
@@ -43,8 +55,10 @@ COPY . .
 # stub lets the linker resolve libcuda.so.1 without a GPU in the build.
 RUN --mount=type=cache,id=ltengine-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=ltengine-cargo-git,target=/root/.cargo/git,sharing=locked \
-    --mount=type=cache,id=ltengine-target-cuda${CUDA_VERSION}-sm${CUDA_ARCHITECTURES},target=/build/target \
+    --mount=type=cache,id=ltengine-target-cuda${CUDA_VERSION}-sm${CUDA_ARCHITECTURES}-mmq${GGML_CUDA_FORCE_MMQ},target=/build/target \
+    RUSTFLAGS="-C target-cpu=${RUST_TARGET_CPU}" \
     CMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+    GGML_CUDA_FORCE_MMQ="${GGML_CUDA_FORCE_MMQ}" \
     LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
     cargo build --locked --release --features cuda -p ltengine \
     && install -Dm755 -s target/release/ltengine /out/ltengine
@@ -69,6 +83,8 @@ COPY --from=builder /out/ltengine /usr/local/bin/ltengine
 # Models are downloaded once into /models (Hugging Face cache layout) or
 # mounted there and selected with LTENGINE_MODEL_FILE.
 ENV HF_HOME=/models \
+    CUDA_CACHE_PATH=/models/.cuda-cache \
+    CUDA_CACHE_MAXSIZE=4294967296 \
     LTENGINE_HOST=0.0.0.0 \
     LTENGINE_PORT=5050 \
     NVIDIA_VISIBLE_DEVICES=all \

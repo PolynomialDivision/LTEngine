@@ -166,11 +166,7 @@ pub fn plan(backend: &LlamaBackend, cfg: &LoadConfig) -> Result<Plan> {
     let n_batch = cfg.batch_size.clamp(n_ubatch.min(n_ctx), n_ctx);
     let n_ubatch = n_ubatch.clamp(1, n_batch);
 
-    let threads = cfg.threads.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map_or(4, |n| u32::try_from(n.get()).unwrap_or(4))
-            .clamp(1, 8)
-    });
+    let threads = cfg.threads.unwrap_or_else(default_threads);
 
     Ok(Plan {
         use_gpu,
@@ -180,6 +176,34 @@ pub fn plan(backend: &LlamaBackend, cfg: &LoadConfig) -> Result<Plan> {
         threads,
         gpu_total_mib,
     })
+}
+
+/// One thread per physical core, within the CPUs this process may use.
+/// Hyper-threads don't help: the CPU part of token generation is limited by
+/// memory bandwidth, and sibling threads just contend for the same core.
+fn default_threads() -> u32 {
+    let usable = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let threads = physical_cores().map_or(usable, |cores| cores.min(usable));
+    u32::try_from(threads).unwrap_or(4).clamp(1, 32)
+}
+
+/// Number of physical cores on Linux (distinct hyper-thread sibling sets).
+fn physical_cores() -> Option<usize> {
+    let cores: std::collections::HashSet<String> = std::fs::read_dir("/sys/devices/system/cpu")
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix("cpu"))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .filter_map(|e| {
+            std::fs::read_to_string(e.path().join("topology/thread_siblings_list")).ok()
+        })
+        .map(|siblings| siblings.trim().to_owned())
+        .collect();
+    (!cores.is_empty()).then_some(cores.len())
 }
 
 /// Context parameters for the persistent inference context.
@@ -367,6 +391,13 @@ pub fn file_type_name(file_type: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_threads_is_sane() {
+        let usable = std::thread::available_parallelism().unwrap().get();
+        let threads = default_threads() as usize;
+        assert!(threads >= 1 && threads <= usable, "{threads} of {usable}");
+    }
 
     #[test]
     fn gpu_layers_parse() {

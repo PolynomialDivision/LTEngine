@@ -79,6 +79,16 @@ pub enum EngineError {
 }
 
 impl EngineError {
+    /// Suggested `Retry-After` in seconds for temporary failures.
+    pub fn retry_after(&self) -> Option<u32> {
+        match self {
+            EngineError::Loading => Some(10),
+            EngineError::Unavailable(_) => Some(15),
+            EngineError::QueueFull | EngineError::QueueTimeout => Some(5),
+            _ => None,
+        }
+    }
+
     /// HTTP status for this error. 4xx errors are deterministic (greedy
     /// decoding gives the same result on retry); 503 means "retry later".
     pub fn status(&self) -> u16 {
@@ -391,9 +401,14 @@ fn log_ready(
         if on_gpu >= total_layers && cpu_overrides == 0 {
             info!("GPU offload: all {total_layers} layers on the GPU");
         } else {
+            let overrides = if cpu_overrides > 0 {
+                format!(", {cpu_overrides} further tensor groups kept in RAM")
+            } else {
+                String::new()
+            };
             warn!(
-                "GPU offload: {on_gpu}/{total_layers} layers on the GPU ({cpu_overrides} tensor groups kept in RAM); \
-                 translations will be slower. Free VRAM or use a smaller quantization for full offload"
+                "GPU offload: {on_gpu}/{total_layers} layers on the GPU{overrides}, the rest runs on the CPU; \
+                 expect slower translations than with full offload"
             );
         }
         if let (Some((free_before, _)), Some((free_after, total))) =

@@ -93,7 +93,7 @@ pub struct Args {
     #[arg(long, env = "LTENGINE_UBATCH_SIZE")]
     ubatch_size: Option<u32>,
 
-    /// CPU threads [default: available cores, at most 8]
+    /// CPU threads [default: physical cores]
     #[arg(long, env = "LTENGINE_THREADS")]
     threads: Option<u32>,
 

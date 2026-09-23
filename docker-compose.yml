@@ -4,7 +4,7 @@
 #   chown -R 99:100 /mnt/user/appdata/ltengine
 #   docker compose up -d --build
 #
-# The first start downloads the model (~2.7 GB) into the models directory;
+# The first start downloads the model (~7 GB) into the models directory;
 # later starts load it from there.
 services:
   ltengine:
@@ -18,15 +18,19 @@ services:
     volumes:
       - /mnt/user/appdata/ltengine/models:/models
     environment:
-      LTENGINE_MODEL: translategemma-4b # Q5_K_M; use translategemma-4b-q4 if the GPU is shared
-      # LTENGINE_MODEL_FILE: /models/translategemma-4b-it.Q5_K_M.gguf  # use a local file instead
+      # TranslateGemma 12B (Q4_K_M, ~7 GB): best quality. On a 4 GB GPU about
+      # a third runs on the GPU, the rest on the CPU (needs ~8 GB free RAM).
+      # For speed over quality: translategemma-4b (fits fully on the GPU).
+      LTENGINE_MODEL: translategemma-12b
+      # LTENGINE_MODEL_FILE: /models/translategemma-12b-it.Q4_K_M.gguf  # use a local file instead
       LTENGINE_CTX_SIZE: "4096"
       LTENGINE_GPU_LAYERS: auto
       LTENGINE_QUEUE_SIZE: "16"
-      LTENGINE_QUEUE_TIMEOUT: "60"
+      # 12B generates ~5-8 tokens/s here; long messages take a minute.
+      LTENGINE_QUEUE_TIMEOUT: "300"
+      # LTENGINE_THREADS: "6"           # default: physical cores
       # LTENGINE_VRAM_MARGIN: "512"      # MiB kept free on the GPU
       # LTENGINE_API_KEY: change-me
-      # RUST_LOG: info
     deploy:
       resources:
         reservations:
@@ -44,7 +48,7 @@ services:
       test: ["CMD", "ltengine", "--healthcheck"]
       interval: 30s
       timeout: 5s
-      start_period: 15m
+      start_period: 30m
       retries: 3
 
 networks:
