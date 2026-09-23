@@ -1,22 +1,52 @@
+# LTEngine on a single small NVIDIA GPU (tuned for a 4 GB GTX 1650 on Unraid).
+#
+#   mkdir -p /mnt/user/appdata/ltengine/models
+#   chown -R 99:100 /mnt/user/appdata/ltengine
+#   docker compose up -d --build
+#
+# The first start downloads the model (~2.7 GB) into the models directory;
+# later starts load it from there.
 services:
   ltengine:
-    image: ghcr.io/libretranslate/ltengine:main
+    build: .
+    image: ltengine:cuda
     container_name: ltengine
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:5050:5050"
+    # Unraid's nobody:users, so files in appdata stay manageable from the host.
+    user: "99:100"
+    init: true
     volumes:
-      - models:/models
+      - /mnt/user/appdata/ltengine/models:/models
     environment:
-      HF_HOME: /models
-      LTENGINE_MODEL: gemma3-4b  # gemma3-1b | gemma3-4b | gemma3-12b | gemma3-27b
+      LTENGINE_MODEL: translategemma-4b # Q5_K_M; use translategemma-4b-q4 if the GPU is shared
+      # LTENGINE_MODEL_FILE: /models/translategemma-4b-it.Q5_K_M.gguf  # use a local file instead
+      LTENGINE_CTX_SIZE: "4096"
+      LTENGINE_GPU_LAYERS: auto
+      LTENGINE_QUEUE_SIZE: "16"
+      LTENGINE_QUEUE_TIMEOUT: "60"
+      # LTENGINE_VRAM_MARGIN: "512"      # MiB kept free on the GPU
+      # LTENGINE_API_KEY: change-me
+      # RUST_LOG: info
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              count: 1
               capabilities: [gpu]
+    # Only reachable from containers on this network (e.g. the Matrix bot at
+    # http://ltengine:5050). Uncomment to expose it on the host's loopback.
+    # ports:
+    #   - "127.0.0.1:5050:5050"
+    networks:
+      - translate
+    healthcheck:
+      test: ["CMD", "ltengine", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15m
+      retries: 3
 
-volumes:
-  models:
+networks:
+  translate:
+    name: translate

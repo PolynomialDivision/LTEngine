@@ -1,372 +1,234 @@
-use actix_web::{
-    get, post, web, App, HttpRequest, HttpResponse, 
-    HttpServer, Responder, http::header, FromRequest
-};
-use actix_multipart::form::{MultipartForm, text::Text as MPText};
-use actix_web_static_files::ResourceFiles;
-use std::sync::Arc;
-use clap::Parser;
-use serde::{Deserialize, Serialize};
+//! LTEngine: local LLM machine translation with a LibreTranslate-compatible API.
 
-mod error_response;
-mod languages;
-mod models;
-mod llm;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::sync::Arc;
+use std::time::Duration;
+
+use actix_web::{App, HttpServer, web};
+use actix_web_static_files::ResourceFiles;
+use clap::Parser;
+use llama_cpp_2::context::params::KvCacheType;
+use llama_cpp_2::{LogOptions, send_logs_to_tracing};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+mod api;
 mod banner;
+mod cache;
+mod engine;
+mod error_response;
+mod formatting;
+mod languages;
+mod loader;
+mod markup;
+mod metrics;
+mod models;
 mod prompt;
 
-use languages::{detect_lang, get_language_from_code, LANGUAGES};
-use error_response::ErrorResponse;
-use models::{MODELS, load_model};
-use banner::print_banner;
-use prompt::PromptBuilder;
+use engine::{Engine, EngineConfig};
+use loader::{GpuLayers, LoadConfig};
+use models::{DEFAULT_MODEL, MODELS};
 
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
+/// Every option can also be set with the environment variable shown in
+/// `--help` (LTENGINE_*), which is the intended way to configure containers.
 #[derive(Parser, Debug, Clone)]
-#[command(version, about, long_about = None)]
-struct Args {
+#[command(version, about = "Local AI machine translation API", long_about = None)]
+pub struct Args {
     /// Hostname to bind to
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, env = "LTENGINE_HOST", default_value = "0.0.0.0")]
     host: String,
 
     /// Port to bind to
-    #[arg(short, long, default_value_t = 5050)]
+    #[arg(short, long, env = "LTENGINE_PORT", default_value_t = 5050)]
     port: u16,
 
     /// Character limit for translation requests
-    #[arg(long, default_value_t = 5000)]
+    #[arg(long, env = "LTENGINE_CHAR_LIMIT", default_value_t = 5000)]
     char_limit: usize,
 
-    /// Model to use
-    #[arg(short='m', long, value_parser = MODELS.keys().collect::<Vec<_>>(), default_value = "gemma3-4b")]
+    /// Model to download and use (ignored when --model-file is set)
+    #[arg(short = 'm', long, env = "LTENGINE_MODEL", value_parser = MODELS.keys().copied().collect::<Vec<_>>(), default_value = DEFAULT_MODEL)]
     model: String,
 
-    /// Path to .gguf model file
-    #[arg(long, default_value = "")]
+    /// Path to a local .gguf model file
+    #[arg(long, env = "LTENGINE_MODEL_FILE", default_value = "")]
     model_file: String,
 
-    /// Set an API key
-    #[arg(long, default_value = "")]
-    api_key: String,  
+    /// Require this API key for requests
+    #[arg(
+        long,
+        env = "LTENGINE_API_KEY",
+        default_value = "",
+        hide_env_values = true
+    )]
+    api_key: String,
 
-    /// Use CPU only
-    #[arg(long)]
+    /// Use the CPU only
+    #[arg(long, env = "LTENGINE_CPU")]
     cpu: bool,
 
-    /// Enable verbose logging
-    #[arg(short = 'v', long)]
-    verbose: bool
+    /// Run on the CPU if no GPU is usable instead of refusing to start
+    #[arg(long, env = "LTENGINE_ALLOW_CPU_FALLBACK")]
+    allow_cpu_fallback: bool,
+
+    /// GPU layers to offload: "auto" (fit to free VRAM), "all" or a number
+    #[arg(long, env = "LTENGINE_GPU_LAYERS", default_value = "auto")]
+    gpu_layers: GpuLayers,
+
+    /// VRAM in MiB to leave free when fitting the model [default: 512 below 8 GiB, else 1024]
+    #[arg(long, env = "LTENGINE_VRAM_MARGIN")]
+    vram_margin: Option<usize>,
+
+    /// Context size in tokens (prompt + translation)
+    #[arg(long, env = "LTENGINE_CTX_SIZE", default_value_t = 4096)]
+    ctx_size: u32,
+
+    /// Maximum tokens submitted per decode call
+    #[arg(long, env = "LTENGINE_BATCH_SIZE", default_value_t = 512)]
+    batch_size: u32,
+
+    /// Physical micro-batch size [default: 128 on GPUs below 6 GiB, else 512]
+    #[arg(long, env = "LTENGINE_UBATCH_SIZE")]
+    ubatch_size: Option<u32>,
+
+    /// CPU threads [default: available cores, at most 8]
+    #[arg(long, env = "LTENGINE_THREADS")]
+    threads: Option<u32>,
+
+    /// KV cache type
+    #[arg(long, env = "LTENGINE_KV_CACHE_TYPE", default_value = "f16", value_parser = ["f16", "q8_0"])]
+    kv_cache_type: String,
+
+    /// Flash attention
+    #[arg(long, env = "LTENGINE_FLASH_ATTN", default_value = "auto", value_parser = ["auto", "on", "off"])]
+    flash_attn: String,
+
+    /// Hard cap on generated tokens per translation (the effective limit also scales with input length)
+    #[arg(long, env = "LTENGINE_MAX_NEW_TOKENS", default_value_t = 2048)]
+    max_new_tokens: u32,
+
+    /// Requests that may wait while a translation is running; more are rejected with 503
+    #[arg(long, env = "LTENGINE_QUEUE_SIZE", default_value_t = 16)]
+    queue_size: usize,
+
+    /// Seconds a request may wait in the queue before it is rejected with 503
+    #[arg(long, env = "LTENGINE_QUEUE_TIMEOUT", default_value_t = 60)]
+    queue_timeout: u64,
+
+    /// Cache up to this many translations in memory (0 = off; keeps message text in RAM)
+    #[arg(long, env = "LTENGINE_CACHE_SIZE", default_value_t = 0)]
+    cache_size: usize,
+
+    /// Enable verbose logging, including llama.cpp's own logs
+    #[arg(short = 'v', long, env = "LTENGINE_VERBOSE")]
+    verbose: bool,
+
+    /// Check whether a local instance is ready and exit (for container health checks)
+    #[arg(long, hide = true)]
+    healthcheck: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct TranslateRequest {
-    q: Option<String>,
-    source: Option<String>,
-    target: Option<String>,
-    format: Option<String>,
-    api_key: Option<String>,
-    alternatives: Option<u32>
-}
-
-#[derive(MultipartForm)]
-struct MPTranslateRequest {
-    q: Option<MPText<String>>,
-    source: Option<MPText<String>>,
-    target: Option<MPText<String>>,
-    format: Option<MPText<String>>,
-    api_key: Option<MPText<String>>,
-    alternatives: Option<MPText<u32>>
-}
-impl MPTranslateRequest {
-    fn into_translate_request(self) -> TranslateRequest {
-        TranslateRequest {
-            q: self.q.map(|v| v.into_inner()),
-            source: self.source.map(|v| v.into_inner()),
-            target: self.target.map(|v| v.into_inner()),
-            format: self.format.map(|v| v.into_inner()),
-            api_key: self.api_key.map(|v| v.into_inner()),
-            alternatives: self.alternatives.map(|v| v.into_inner()),
-        }
-    }
-}
-
-async fn parse_payload(req: HttpRequest, payload: web::Payload) -> Result<TranslateRequest, ErrorResponse>{
-    let content_type = req.headers().get(header::CONTENT_TYPE).map(|h| h.to_str().unwrap_or("")).unwrap_or("");
-    let body: TranslateRequest;
-
-    if content_type.starts_with("application/json") {
-        let json = actix_web::web::Json::<TranslateRequest>::from_request(&req, &mut payload.into_inner()).await?;
-        body = json.into_inner()
-    } else if content_type.starts_with("application/x-www-form-urlencoded") {
-        let form = actix_web::web::Form::<TranslateRequest>::from_request(&req, &mut payload.into_inner()).await?;
-        body = form.into_inner()
-    } else if content_type.starts_with("multipart/form-data") {
-        let form = MultipartForm::<MPTranslateRequest>::from_request(&req, &mut payload.into_inner()).await?;
-        body = form.into_inner().into_translate_request();
-    } else {
-        return Err(ErrorResponse{ error: "Unsupported content-type".to_string(), status: 400 });
-    }
-
-    return Ok(body);
-}
-
-fn check_params(body: &TranslateRequest, args: &Args, required_params: &[(&str, &Option<String>)]) -> Result<bool, ErrorResponse> {
-    // Validate required params
-    for (key, value) in required_params {
-        if value.as_ref().is_none_or(|v| v.trim().is_empty()) {
-            return Err(ErrorResponse {
-                error: format!("Invalid request: missing {} parameter", key),
-                status: 400,
-            });
-        }
-    }
-    
-    // Check key
-    if !args.api_key.is_empty() && body.api_key.as_ref().is_none_or(|key| *key != args.api_key) {
-        return Err(ErrorResponse {
-            error: format!("Invalid API key"),
-            status: 403,
-        });
-    }
-
-    let q = body.q.as_ref().unwrap();
-    if q.len() > args.char_limit {
-        return Err(ErrorResponse {
-            error: format!("Invalid request: request ({}) exceeds text limit ({})", q.len(), args.char_limit),
-            status: 400,
-        });
-    }
-
-    Ok(true)
-}
-
-fn improve_formatting(q: &String, translation: &String) -> String {
-    let t = translation.trim().to_string();
-
-    if q.len() == 0 {
-        return String::new();
-    }
-
-    if t.len() == 0 {
-        return q.clone();
-    }
-
-    let q_last_char = q.chars().rev().next().unwrap();
-    let translation_last_char = t.chars().rev().next().unwrap();
-    let mut result = t.clone();
-
-    const PUNCTUATION_CHARS: [char; 6] = ['!', '?', '.', ',', ';', '。'];
-    if PUNCTUATION_CHARS.contains(&q_last_char){
-        if q_last_char != translation_last_char{
-            if PUNCTUATION_CHARS.contains(&translation_last_char){
-                result.pop();
-            }
-
-            result.push(q_last_char);
-        }
-    }else if PUNCTUATION_CHARS.contains(&translation_last_char) {
-        result.pop();   
-    }
-
-    if q.chars().all(|c| c.is_lowercase()) {
-        result = result.to_lowercase();
-    }
-
-    if q.chars().all(|c| c.is_uppercase()) {
-        result = result.to_uppercase();
-    }
-
-    if let (Some(q0), Some(r0)) = (q.chars().next(), result.chars().next()) {
-        if q0.is_lowercase() && r0.is_uppercase() {
-            result.replace_range(0..r0.len_utf8(), &r0.to_lowercase().to_string());
-        }else if q0.is_uppercase() && r0.is_lowercase() {
-            result.replace_range(0..r0.len_utf8(), &r0.to_uppercase().to_string());
-        }
-    }
-
-    result.trim().to_string()
-}
-
-#[post("/detect")]
-async fn detect(req: HttpRequest, payload: web::Payload, args: web::Data<Arc<Args>>) -> Result<HttpResponse, ErrorResponse> {
-    let body = parse_payload(req, payload).await?;
-    check_params(&body, &args, &[
-        ("q", &body.q)
-    ])?;
-
-    let q = body.q.unwrap();
-    let d = detect_lang(&q);
-
-    Ok(HttpResponse::Ok().json(serde_json::json!([{
-        "language": d.language.code,
-        "confidence": d.confidence
-    }])))
-}
-
-fn check_format(format: &str) -> Result<bool, ErrorResponse> {
-    match format {
-        "text" | "html" => Ok(true),
-        _ => Err(ErrorResponse {
-            error: "Invalid format. Supported formats: text, html".to_string(),
-            status: 400,
-        })
-    }
-}
-
-#[post("/translate")]
-async fn translate(req: HttpRequest, payload: web::Payload, args: web::Data<Arc<Args>>, llm: actix_web::web::Data<Arc<llm::LLM>>) -> Result<HttpResponse, ErrorResponse> {
-    let body = parse_payload(req, payload).await?;
-    check_params(&body, &args, &[
-        ("q", &body.q),
-        ("source", &body.source),
-        ("target", &body.target),
-    ])?;
-
-    let q = body.q.unwrap();
-    let source = body.source.unwrap();
-    let target = body.target.unwrap();
-    let format = body.format.unwrap_or("text".to_string());
-    check_format(&format)?;
-    
-    let mut pb = PromptBuilder::new();
-    pb.set_format(&format);
-
-    // TODO: add HTML support
-    
-    if source == "auto"{
-        pb.set_source_language("auto");
-    }else{
-        let src_lang = get_language_from_code(&source).ok_or_else(|| ErrorResponse {
-            error: format!("{} is not supported", source),
-            status: 400,
-        })?;
-        pb.set_source_language(src_lang.name);
-    }
-
-    let tgt_lang = get_language_from_code(&target).ok_or_else(|| ErrorResponse {
-        error: format!("{} is not supported", target),
-        status: 400,
-    })?;
-    pb.set_target_language(tgt_lang.name);
-
-    let llm = llm.get_ref();
-    let prompt = pb.build(&q);
-    
-    let translated_text = if source != target {
-        llm.run_prompt(prompt.system, prompt.user).await.map_err(|e| {
-            let status = if e.is::<llm::LLMError>() { 503 } else { 500 };
-            let msg = format!("{:#}", e);
-            eprintln!("translation error: {}", msg);
-            ErrorResponse { error: msg, status }
-        })?
-    } else {
-        q.clone()
-    };
-    
-    let mut response = serde_json::json!({"translatedText": improve_formatting(&q, &translated_text)});
-
-    // TODO: we just add this for compatibility for now
-    // we should allow multiple alternatives to be generated
-    if body.alternatives.is_some_and(|v| v > 0) {
-        response["alternatives"] = serde_json::json!([]);
-    }
-
-    if source == "auto" {
-        let d = detect_lang(&q);
-        response["detectedLanguage"] = serde_json::json!({
-            "language": d.language.code,
-            "confidence": d.confidence
-        });
-    }
-
-    Ok(HttpResponse::Ok().json(response))
-}
-
-#[post("/translate_file")]
-async fn translate_file() -> Result<HttpResponse, ErrorResponse> {
-    Err(ErrorResponse{
-        error: "Not implemented".to_string(),
-        status: 501
-    })
-}
-
-#[post("/suggest")]
-async fn suggest() -> Result<HttpResponse, ErrorResponse> {
-    Err(ErrorResponse{
-        error: "Not implemented".to_string(),
-        status: 501
-    })
-}
-
-#[get("/languages")]
-async fn get_languages() -> impl Responder {
-    HttpResponse::Ok().json(&*LANGUAGES)
-}
-
-#[get("/frontend/settings")]
-async fn get_frontend_settings(args: web::Data<Arc<Args>>) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "apiKeys": false,
-        "charLimit": args.char_limit,
-        "filesTranslation": false,
-        "frontendTimeout": 1000,
-        "keyRequired": false,
-        "language": {
-            "source": {
-                "code": "auto",
-                "name": "Auto Detect"
+impl Args {
+    fn engine_config(&self) -> EngineConfig {
+        EngineConfig {
+            model: self.model.clone(),
+            model_file: self.model_file.clone(),
+            load: LoadConfig {
+                cpu: self.cpu,
+                allow_cpu_fallback: self.allow_cpu_fallback,
+                gpu_layers: self.gpu_layers,
+                vram_margin_mib: self.vram_margin,
+                ctx_size: self.ctx_size,
+                batch_size: self.batch_size,
+                ubatch_size: self.ubatch_size,
+                threads: self.threads,
+                kv_cache_type: if self.kv_cache_type == "q8_0" {
+                    KvCacheType::Q8_0
+                } else {
+                    KvCacheType::F16
+                },
+                flash_attn: match self.flash_attn.as_str() {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                },
             },
-            "target": {
-                "code": "en",
-                "name": "English"
-            }
-        },
-        "suggestions": false,
-        "supportedFilesFormat": []
-    }))
+            max_new_tokens: self.max_new_tokens.max(1),
+            queue_size: self.queue_size,
+            queue_timeout: Duration::from_secs(self.queue_timeout),
+        }
+    }
+}
+
+fn init_logging(verbose: bool) {
+    let default = if verbose {
+        "debug,llama_cpp_2=info"
+    } else {
+        "info,llama_cpp_2=warn"
+    };
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+        .init();
+    // llama.cpp/ggml logs go through tracing and the filter above.
+    send_logs_to_tracing(LogOptions::default());
+}
+
+/// Exit 0 if the local server reports ready.
+fn healthcheck(port: u16) -> i32 {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let check = || -> std::io::Result<bool> {
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.write_all(b"GET /health/ready HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"))
+    };
+    i32::from(!check().unwrap_or(false))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let args = Arc::new(Args::parse());
+    if args.healthcheck {
+        std::process::exit(healthcheck(args.port));
+    }
+    init_logging(args.verbose);
+    banner::print_banner();
+    info!(version = env!("CARGO_PKG_VERSION"), "starting LTEngine");
 
-    let host = args.host.clone();
-    let port = args.port;
-
-    let model_path = load_model(&args.model, &args.model_file).unwrap_or_else(|err| {
-        eprintln!("Failed to load model: {}", err);
-        std::process::exit(1);
+    // The HTTP server comes up while the model downloads/loads so that health
+    // checks and clients get a clear "loading" answer instead of connection errors.
+    let metrics = Arc::new(metrics::Metrics::default());
+    let engine = Engine::start(args.engine_config(), metrics.clone());
+    let state = web::Data::new(api::AppState {
+        args: args.clone(),
+        engine,
+        metrics,
+        cache: cache::TranslationCache::new(args.cache_size),
     });
-    
-    println!("Loading model: {}", model_path.display());
 
-    let llm = Arc::new(llm::LLM::new(model_path, args.cpu, args.verbose).unwrap_or_else(|err| {
-        eprintln!("Failed to initialize LLM: {}", err);
-        std::process::exit(1);
-    }));
-
-    print_banner();
-
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4));
     let server = HttpServer::new(move || {
-        let generated = generate();
-
         App::new()
-            // .service(index)
-            .app_data(web::Data::new(llm.clone()))
-            .app_data(web::Data::new(args.clone()))
-            .service(get_languages)
-            .service(get_frontend_settings)
-            .service(translate)
-            .service(translate_file)
-            .service(detect)
-            .service(suggest)
-            .service(ResourceFiles::new("/", generated))
+            .app_data(state.clone())
+            .app_data(web::JsonConfig::default().limit(256 * 1024))
+            .app_data(web::FormConfig::default().limit(256 * 1024))
+            .configure(api::configure)
+            .service(ResourceFiles::new("/", generate()))
     })
-    .bind((host.clone(), port))?
+    .on_connect(api::capture_peer_socket)
+    .workers(workers)
+    .shutdown_timeout(10)
+    .bind((args.host.as_str(), args.port))?
     .run();
 
-    println!("Running on: http://{}:{}", host, port);
-
-    return server.await;
+    info!("listening on http://{}:{}", args.host, args.port);
+    server.await
 }
