@@ -9,7 +9,6 @@ use actix_web::{App, HttpServer, web};
 use actix_web_static_files::ResourceFiles;
 use clap::Parser;
 use llama_cpp_2::context::params::KvCacheType;
-use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -165,9 +164,9 @@ impl Args {
 
 fn init_logging(verbose: bool) {
     let default = if verbose {
-        "debug,llama_cpp_2=info"
+        "debug,llama_cpp=info"
     } else {
-        "info,llama_cpp_2=warn"
+        "info,llama_cpp=warn"
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
     tracing_subscriber::fmt()
@@ -175,8 +174,38 @@ fn init_logging(verbose: bool) {
         .with_target(false)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
-    // llama.cpp/ggml logs go through tracing and the filter above.
-    send_logs_to_tracing(LogOptions::default());
+    // llama-cpp-2's own forwarding (`send_logs_to_tracing`) emits events
+    // without asking the subscriber, which bypasses the filter above. Route
+    // llama.cpp/ggml logs through the regular macros instead.
+    // SAFETY: the callback is a plain function without user data.
+    unsafe {
+        llama_cpp_sys_2::llama_log_set(Some(forward_llama_log), std::ptr::null_mut());
+        llama_cpp_sys_2::ggml_log_set(Some(forward_llama_log), std::ptr::null_mut());
+    }
+}
+
+/// llama.cpp/ggml log callback, filtered under the `llama_cpp` target.
+unsafe extern "C" fn forward_llama_log(
+    level: llama_cpp_sys_2::ggml_log_level,
+    text: *const std::ffi::c_char,
+    _user_data: *mut std::ffi::c_void,
+) {
+    if text.is_null() {
+        return;
+    }
+    // SAFETY: llama.cpp passes a valid NUL-terminated string.
+    let text = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
+    let text = text.trim_end();
+    if text.is_empty() {
+        return;
+    }
+    match level {
+        llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR => tracing::error!(target: "llama_cpp", "{text}"),
+        llama_cpp_sys_2::GGML_LOG_LEVEL_WARN => tracing::warn!(target: "llama_cpp", "{text}"),
+        llama_cpp_sys_2::GGML_LOG_LEVEL_INFO => tracing::info!(target: "llama_cpp", "{text}"),
+        // DEBUG and CONT (progress fragments of the previous line).
+        _ => tracing::debug!(target: "llama_cpp", "{text}"),
+    }
 }
 
 /// Exit 0 if the local server reports ready.

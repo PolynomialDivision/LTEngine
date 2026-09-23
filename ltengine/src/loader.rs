@@ -17,6 +17,7 @@ use std::pin::pin;
 use anyhow::{Context, Result, anyhow, bail};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
+use llama_cpp_2::gguf::GgufContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::LlamaModel;
@@ -206,15 +207,25 @@ pub fn context_params(cfg: &LoadConfig, plan: &Plan) -> LlamaContextParams {
         .with_no_perf(true)
 }
 
-/// Read only the vocabulary and hyperparameters (cheap) to learn the layer count.
-pub fn probe_layer_count(backend: &LlamaBackend, path: &Path) -> Result<u32> {
-    let model = LlamaModel::load_from_file(
-        backend,
-        path,
-        &LlamaModelParams::default().with_vocab_only(true),
-    )
-    .with_context(|| format!("unable to read model metadata from {}", path.display()))?;
-    Ok(model.n_layer())
+/// Read the layer count (`<architecture>.block_count`) from the GGUF header
+/// without loading the model.
+pub fn probe_layer_count(path: &Path) -> Result<u32> {
+    let gguf = GgufContext::from_file(path)
+        .with_context(|| format!("unable to read GGUF metadata from {}", path.display()))?;
+    let value = |key: &str, ty| {
+        let idx = gguf.find_key(key);
+        (idx >= 0 && gguf.kv_type(idx) == ty).then_some(idx)
+    };
+    let architecture = value("general.architecture", llama_cpp_sys_2::GGUF_TYPE_STRING)
+        .and_then(|idx| gguf.val_str(idx))
+        .context("GGUF has no general.architecture")?;
+    let key = format!("{architecture}.block_count");
+    if let Some(idx) = value(&key, llama_cpp_sys_2::GGUF_TYPE_UINT32) {
+        return Ok(gguf.val_u32(idx));
+    }
+    value(&key, llama_cpp_sys_2::GGUF_TYPE_INT32)
+        .and_then(|idx| u32::try_from(gguf.val_i32(idx)).ok())
+        .with_context(|| format!("GGUF has no {key}"))
 }
 
 /// Load the model. `layers == None` lets llama.cpp fit the offload to free VRAM.
@@ -366,6 +377,17 @@ mod tests {
         );
         assert_eq!("20".parse::<GpuLayers>().unwrap(), GpuLayers::Count(20));
         assert!("many".parse::<GpuLayers>().is_err());
+    }
+
+    /// Set `LTENGINE_TEST_MODEL` to a GGUF file to run this.
+    #[test]
+    fn layer_count_comes_from_gguf_header() {
+        let Ok(path) = std::env::var("LTENGINE_TEST_MODEL") else {
+            return;
+        };
+        let n = probe_layer_count(Path::new(&path)).unwrap();
+        assert!(n > 0, "{path}: {n} layers");
+        eprintln!("{path}: {n} layers");
     }
 
     #[test]

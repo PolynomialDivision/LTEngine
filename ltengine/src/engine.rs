@@ -285,7 +285,7 @@ fn run(config: &EngineConfig, shared: &Shared, rx: Receiver<Job>) -> anyhow::Res
         "inference settings"
     );
 
-    let n_layer = loader::probe_layer_count(&backend, &model_path)?;
+    let n_layer = loader::probe_layer_count(&model_path)?;
     let vram_before = loader::vram_mib();
     let mut layers = match (plan.use_gpu, config.load.gpu_layers) {
         (false, _) => Some(0),
